@@ -11,20 +11,109 @@ related-issues: (will contain links to implementation PRs)
 # Summary
 [summary]: #summary
 
-Make convenient pure evaluation and evaluation caching available to Nix expressions and the traditional CLI.
-
-This allows detangling Flakes from Nix evaluation, making it possible to implement Flakes as a layer on top of a non-Flakes CLI.
+Add new Nix language builtins, to allow explicit use of pure evaluation and evaluation caching.
 
 # Motivation
 [motivation]: #motivation
 
-Why are we doing this? What use cases does it support? What is the expected
-outcome?
+Pure evaluation and evaluation caching are currently intertwined with Flakes, which is still labeled as experimental and suffers from a number of problems.
+This RFC proposes a way to make these two features independent from Flakes, allowing them to be used in stable Nix via new builtins.
 
-RFC 140 can use the pure eval
+Doing this is a big step towards Flakes stabilisation, while also enabling many use cases independently of it.
 
 # Detailed design
 [design]: #detailed-design
+
+## Evaluation purity builtin
+
+### New Nix language value type `RelativeNixPath`
+
+Contains:
+- `prefix`: A String representing the Nix path prefix the path is under
+- `components`, A list of Strings representing the relative path under the nix path prefix
+
+This type is only available for pure evaluation mode, while the traditional path value type is only available for impure evaluation mode.
+
+Very similar to a path:
+- Construction:
+  - `<foo/bar>` turns into `("foo", ["bar"])`
+  - `./.` turns into the prefix of the Nix path entry the current Nix file is contained in and the relative path under it
+    - Not allowed for paths not included in the Nix path prefixes
+  - `/foo` is not allowed
+- Operations:
+  - `dirOf` is only valid if the components aren't empty, returns a new path with the last component removed
+  - `baseNameOf` is only valid if the components aren't empty, returns the last component
+  - `toString` returns `<prefix/component1/component2>`
+  - `pathExists` only valid if the `filter` doesn't filter out this path
+  - `readDir` filters out entries in the `filter`
+  - `readFile` and `import` only works on files not `filter`ed out
+  - `builtins.path` and `builtins.filterSource` work, but the filter function gets a RelativeNixPath as the first argument, and only paths not filtered out by the nix path `filter` are available
+  - `typeOf` is `path`
+
+What happens if a pure part of evaluation returns such a path to an impure part of the code?
+
+FIXME: Okay this is not doable, we need to keep the same path value type
+We should just change the behavior of builtin functions when pure mode is enabled
+
+
+### Introduce `builtins.relativeToNixPath`
+
+Type: `Path -> { prefix :: Path, components :: [ String ] }`
+
+Only available for pure evaluation mode paths
+For a given path, returns the nix path prefix its in and the relative components
+
+### Introduce `builtins.pureImport`
+
+Type: `{ pureNixPath :: AttrsOf { path :: Path, filter :: Path -> String -> Bool } } -> Path -> Any`
+
+```
+pureImport {
+  pureNixPath.project = {
+    path = ./.;
+    filter = path: type: true;
+  };
+} ./foo.nix
+```
+
+Imports and evaluates a Nix file using pure evaluation mode and setting `builtins.nixPath` to `[ { prefix = "project"; path = ./.; filter = ...; hash = "..."; } ]`.
+The hash is computed lazily when needed, it hashes the contents of all included files.
+
+What are the restrictions related to path in pure eval mode?
+- The imported file, and any files it transitively imports for evaluation:
+  - Must not contain absolute path expressions
+  - All relative path expressions must refer to paths that escape all `builtins.nixPath` prefixes.
+    E.g. `../../foo/bar` is only allowed if `../..` is in a nix path prefix
+  - Parsed paths should be represented as a (prefix, components) pair, see `builtins.relativeToNixPath` below.
+- Overall it must be ensured that all paths during evaluation are in some nix path prefix
+- `toString` on such paths is not allowed
+- `dirOf` and `baseNameOf` is only valid if the parent path is a path under a nix path prefix
+- `readDir`, `readFile`, `readFileType`, `hashFile`, `import` and `scopedImport` is only valid on paths to files that aren't filtered out, it doesn't work on strings
+- `builtins.path` needs to be replaced with something better
+
+In the future, this builtins can be extended with more attribute arguments such as:
+- `currentSystem`: Allow pure code to access `builtins.currentSystem`
+- `currentTime`
+- `args`: With a potential new `builtins.args` that exposes the `--arg`/`--argstr`, allowing nested code to access it
+- And any other builtins that would normally be restricted to pure evaluation mode
+
+### Introduce `builtins.inPureEvalMode`
+
+Type: `Bool`
+Default: `false`
+
+Whether this expression is evaluated in pure evaluation mode. This is almost an implementation detail, needed for thunks to know whether they need to be evaluated purely or not.
+
+The evaluator needs to ensure that this builtin cannot be shadowed, probably would be good for all builtins.
+
+## Evaluation caching
+
+
+
+
+
+
+
 
 - Maybe enforce that builtins cannot be overridden. Could be done only in pure evaluation, though it probably doesn't hurt to do it always. Or maybe only if `builtins.pureEval` is `true`, it cannot be set to `false`, should be enough
 - Add `builtins.allowedPaths`, some structure that can be queried for which paths are allowed
